@@ -1,0 +1,26 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - revive
+    - gocritic
+    - bodyclose
+    - unconvert
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true # doc comments are enforced manually, not every exported symbol needs one yet
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

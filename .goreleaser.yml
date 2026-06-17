@@ -1,0 +1,30 @@
+version: 2
+
+# grr is a library, not a binary — there's nothing to build/release as an
+# artifact. goreleaser here only drives the GitHub Release + changelog
+# generation from conventional commits on tag push.
+builds:
+  - skip: true
+
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*feat[(\w)]*:+.*$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*fix[(\w)]*:+.*$'
+      order: 1
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+
+release:
+  github:
+    owner: arpaad
+    name: grr
