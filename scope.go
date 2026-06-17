@@ -32,55 +32,96 @@ func (sd *scopeData) onceFor(key string) *onceValue {
 	return ov
 }
 
-var (
-	scopeCounter uint64
+// scopeCounter hands out process-globally-unique scope IDs. It's a single
+// atomic add (no lock, negligible contention), kept global on purpose so an
+// ID minted by one store can never collide with another store's — using a
+// context from one registry chain against an unrelated one then correctly
+// misses and panics, instead of silently hitting a same-numbered scope.
+var scopeCounter uint64
 
-	scopesMu sync.RWMutex
-	scopes   = make(map[uint64]*scopeData)
-)
+// scopeStore owns the scope cache for a registry chain: the live scopes and
+// the mutex guarding them. One store is shared across a parent/child chain
+// (NewFrom shares the parent's), while an independent New() gets its own —
+// so isolated registries have isolated scope state and don't contend on a
+// single process-wide lock.
+type scopeStore struct {
+	mu     sync.RWMutex
+	scopes map[uint64]*scopeData
+}
+
+func newScopeStore() *scopeStore {
+	return &scopeStore{scopes: make(map[uint64]*scopeData)}
+}
+
+func (s *scopeStore) begin() uint64 {
+	id := atomic.AddUint64(&scopeCounter, 1)
+	s.mu.Lock()
+	s.scopes[id] = &scopeData{once: make(map[string]*onceValue)}
+	s.mu.Unlock()
+	return id
+}
+
+func (s *scopeStore) get(id uint64) (*scopeData, bool) {
+	s.mu.RLock()
+	sd, ok := s.scopes[id]
+	s.mu.RUnlock()
+	return sd, ok
+}
+
+func (s *scopeStore) cleanup(id uint64) {
+	s.mu.Lock()
+	delete(s.scopes, id)
+	s.mu.Unlock()
+}
 
 // BeginScope starts a new scope tied to ctx and returns a derived context
 // plus an endScope function that releases the scope's cached instances.
 // endScope is safe to call multiple times. If ctx is cancelled before
 // endScope is called explicitly, the scope is cleaned up automatically.
 //
-// Scope storage is shared across a whole parent/child registry chain
-// (scope IDs are globally unique), so a scoped entry registered on a
-// parent resolves correctly even when BeginScope was called on a child.
+// Scope storage is shared across a whole parent/child registry chain, so a
+// scoped entry registered on a parent resolves correctly even when
+// BeginScope was called on a child.
 func (r *Registry) BeginScope(parent context.Context) (context.Context, func()) {
-	scopeID := atomic.AddUint64(&scopeCounter, 1)
+	store := r.scopes
+	scopeID := store.begin()
 	ctx := context.WithValue(parent, scopeKey{}, scopeID)
 
-	scopesMu.Lock()
-	scopes[scopeID] = &scopeData{once: make(map[string]*onceValue)}
-	scopesMu.Unlock()
+	if r.hooks.OnScopeBegin != nil {
+		r.hooks.OnScopeBegin()
+	}
+
+	// release runs the actual teardown exactly once, whichever path gets
+	// there first (explicit endScope or ctx cancellation).
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			store.cleanup(scopeID)
+			if r.hooks.OnScopeEnd != nil {
+				r.hooks.OnScopeEnd()
+			}
+		})
+	}
 
 	stop := make(chan struct{})
-
 	go func() {
 		select {
 		case <-ctx.Done():
-			cleanupScope(scopeID)
+			release()
 		case <-stop:
-			// endScope already cleaned up synchronously.
+			// endScope already released synchronously.
 		}
 	}()
 
-	var once sync.Once
+	var endOnce sync.Once
 	endScope := func() {
-		once.Do(func() {
-			cleanupScope(scopeID)
+		endOnce.Do(func() {
+			release() // synchronous teardown — callers expect it done on return
 			close(stop)
 		})
 	}
 
 	return ctx, endScope
-}
-
-func cleanupScope(scopeID uint64) {
-	scopesMu.Lock()
-	defer scopesMu.Unlock()
-	delete(scopes, scopeID)
 }
 
 func scopeIDFromCtx(ctx context.Context) (uint64, bool) {

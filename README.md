@@ -49,12 +49,20 @@ go get github.com/arpaad/grr
 | Factory, no ctx needed | `r.RegisterFunc(key, func() any)` |
 | One instance per scope | `r.RegisterScoped(key, func(ctx) any)` |
 | Lookup | `r.Resolve(ctx, key)` / `r.Get(key)` (sugar for `Resolve(context.Background(), key)`) |
+| Lookup, non-panicking | `r.ResolveOK(ctx, key)` → `(any, bool)` — `false` only when the key isn't registered |
 | Scope lifecycle | `ctx, end := r.BeginScope(ctx); defer end()` |
 | Conditional registration check | `r.IsRegistered(key)` |
+| List own keys (not parents) | `r.Keys()` |
 | Test teardown | `r.Clear()` |
 | Isolated registry | `grr.New()` |
 | Parent-chain registry | `grr.NewFrom(parent)` |
+| Registry with observability hooks | `grr.New(grr.WithHooks(grr.Hooks{...}))` |
 | Attach/read registry via ctx | `grr.WithRegistry(ctx, r)` / `grr.RegistryFromCtx(ctx)` |
+
+`ResolveOK` softens **only** the "key not registered" case — resolving a
+scoped key with no active scope, a circular dependency, or resolving after
+a scope ended all still panic, because those are bugs, not conditions to
+branch on.
 
 HTTP integration: `grr/middleware` for `net/http` (and anything built on it, e.g. Chi). For Gin, see the separate [grr-gin](https://github.com/arpaad/grr-gin) module — kept out of core so `grr` itself never needs a Gin dependency.
 
@@ -81,9 +89,50 @@ func TestIsolated(t *testing.T) {
 
 Runnable examples live in [example_test.go](example_test.go) and on [pkg.go.dev](https://pkg.go.dev/github.com/arpaad/grr).
 
+## Observability
+
+Attach optional hooks at construction. A `nil` hook is never called, so the
+default (no hooks) costs a single nil check per event and nothing more:
+
+```go
+r := grr.New(grr.WithHooks(grr.Hooks{
+    OnResolve:    func(key string, dur time.Duration) { metrics.Observe(key, dur) },
+    OnScopeBegin: func() { ... },
+    OnScopeEnd:   func() { ... },
+}))
+```
+
+Hooks belong to the registry they're set on: `Resolve`/`BeginScope` called
+on this registry fire its hooks, regardless of which registry in a parent
+chain owns the entry. `OnScopeEnd` fires exactly once per scope, whether it
+ends via `endScope` or ctx cancellation.
+
+## Benchmarks
+
+`go test -bench=. -benchmem`. Numbers from an AMD Ryzen AI 9 HX 370, Go
+1.25 — reproduce them yourself rather than trusting the absolute values;
+what matters is the ratio between the cases.
+
+| Benchmark | ns/op | allocs/op |
+|---|---:|---:|
+| `ResolveNonScoped` | ~160 | 3 |
+| `ResolveScopedCached` (the dominant case) | ~110 | 0 |
+| `ParentChainLookup` (8 levels deep) | ~340 | 3 |
+| `BeginEndScope` (open + close) | ~2000 | 10 |
+
+The scoped cache-hit path — every resolve after the first within a scope —
+is allocation-free. The per-resolve allocations on the other paths come
+from threading the build-chain (cycle detection) through `context`; trimming
+that is a tracked optimization (see [plan.md](plan.md)).
+
 ## Status
 
-v0.1 — core registry, scope lifecycle (with cycle detection), `net/http` middleware. See [plan.md](plan.md) for what's coming next (pooled lifetime, observability hooks, benchmarks) and [ARCHITECTURE.md](ARCHITECTURE.md) for the full design history and the reasoning behind every non-obvious decision.
+v0.2-dev — core registry, scope lifecycle (with cycle detection),
+`net/http` middleware, observability hooks, `ResolveOK`/`Keys`, and a
+per-chain scope store (isolated `New()` registries no longer share a global
+scope table). See [plan.md](plan.md) for what's next and [ARCHITECTURE.md](ARCHITECTURE.md)
+for the full design history and the reasoning behind every non-obvious
+decision.
 
 ## License
 

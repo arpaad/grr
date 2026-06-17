@@ -14,8 +14,8 @@ If you're asked to change something here, check whether `gold` or `grr-gin` also
 
 ## Where the reasoning lives
 
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** — the original design doc plus a log of every decision made (and bug found) during implementation. Read this before changing core semantics — several things that look like they could be "simplified" (global scope storage instead of per-registry, per-key `sync.Once` instead of one big lock, the build-chain cycle check) were deliberate fixes for real bugs (deadlocks), not arbitrary choices.
-- **[plan.md](plan.md)** — phase-2 roadmap (pooled lifetime, observability hooks, more examples, benchmarks). Nothing in here is implemented yet; check before assuming a feature exists.
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — the original design doc plus a log of every decision made (and bug found) during implementation. Read this before changing core semantics — several things that look like they could be "simplified" (the **process-global scope ID counter** paired with **per-chain** scope storage, per-key `sync.Once` instead of one big lock, the build-chain cycle check) were deliberate fixes for real bugs (deadlocks, cross-store ID collisions), not arbitrary choices.
+- **[plan.md](plan.md)** — phase-2 roadmap. Implemented so far: per-chain scope store, observability hooks, `ResolveOK`, `Keys`. Still open: the cleanup-goroutine decision, more examples, the build-chain allocation trim. Pooled lifetime was **dropped on purpose** (see plan.md). Check before assuming a feature exists.
 - **[README.md](README.md)** — the public-facing pitch and rationale, written for Go developers evaluating whether to depend on this. Keep it in sync if you change public API or behavior.
 
 ## Hard constraints — don't violate these without a conversation first

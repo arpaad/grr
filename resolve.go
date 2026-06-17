@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Resolve looks up key, walking the parent chain if necessary, and
@@ -11,6 +12,11 @@ import (
 // registered anywhere in the chain, or if key is scoped but ctx carries
 // no active scope (see BeginScope).
 func (r *Registry) Resolve(ctx context.Context, key string) any {
+	if r.hooks.OnResolve != nil {
+		start := time.Now()
+		defer func() { r.hooks.OnResolve(key, time.Since(start)) }()
+	}
+
 	e := r.findEntry(key)
 	if e == nil {
 		panic(fmt.Sprintf("grr: key %q not registered", key))
@@ -32,9 +38,7 @@ func (r *Registry) Resolve(ctx context.Context, key string) any {
 		panic(fmt.Sprintf("grr: key %q is scoped but ctx has no active scope (call BeginScope first)", key))
 	}
 
-	scopesMu.RLock()
-	sd, ok := scopes[scopeID]
-	scopesMu.RUnlock()
+	sd, ok := r.scopes.get(scopeID)
 	if !ok {
 		// Scope was ended (or never began) — treat as programmer error.
 		panic(fmt.Sprintf("grr: key %q resolved after its scope ended", key))
@@ -45,6 +49,19 @@ func (r *Registry) Resolve(ctx context.Context, key string) any {
 		ov.value = e.factory(withBuildChain(ctx, key))
 	})
 	return ov.value
+}
+
+// ResolveOK is like Resolve but reports a missing key with ok == false
+// instead of panicking — for genuinely conditional lookups (e.g. an
+// optional, feature-flagged registration). It does NOT soften real misuse:
+// resolving a scoped key with no active scope, a circular dependency, or
+// resolving after a scope ended still panic, because those are bugs, not
+// conditions to branch on.
+func (r *Registry) ResolveOK(ctx context.Context, key string) (any, bool) {
+	if r.findEntry(key) == nil {
+		return nil, false
+	}
+	return r.Resolve(ctx, key), true
 }
 
 // Get is sugar for Resolve(context.Background(), key). Panics if key

@@ -1,124 +1,149 @@
 # `grr` – Go Registry Resolver
-> Verziószám: 0.1 | Státusz: implementálva
 
-> Ez a fájl a v0.1 tervezési dokumentuma és a megvalósítás közben hozott döntések napló­ja — a "miért van úgy, ahogy van" forrása. A jövőbeli munkát a [plan.md](plan.md) (2. fázis roadmap) vezeti, ez itt a történeti referencia.
-
----
-
-## Alapkoncepció
-
-Névhez kötött factory/value tároló. Általános célú primitív – nem HTTP-specifikus, nem DI framework. Önállóan használható, a `gold` erre épül.
+> Version: 0.2-dev | Status: implemented
+>
+> This file is the design document and the running log of decisions made
+> while building `grr` — the "why is it the way it is" reference. Future
+> work is driven by [plan.md](plan.md) (the Phase 2 roadmap); this is the
+> historical reference.
 
 ---
 
-## Repo struktúra
+## Core concept
+
+A name-keyed factory/value store. A general-purpose primitive — not
+HTTP-specific, not a DI framework. Usable on its own; [gold](https://github.com/arpaad/gold)
+builds a typed layer on top of it.
+
+---
+
+## Repo structure
 
 ```
 github.com/arpaad/grr       ← core + net/http middleware
-github.com/arpaad/grr-gin   ← Gin middleware, külön repo, dep: grr
-github.com/arpaad/gold      ← Logic réteg, külön repo, dep: grr
+github.com/arpaad/grr-gin   ← Gin middleware, separate repo, dep: grr
+github.com/arpaad/gold      ← Logic layer, separate repo, dep: grr
 ```
 
-Minden repo független release ciklus. Ha később jön Echo, Fiber vagy más – új repo, nem érinti a többit.
+Every repo has an independent release cycle. If Echo, Fiber, or anything
+else comes later — new repo, no impact on the rest.
 
 ---
 
-## Fájlszerkezet
+## File layout
 
 ```
 grr/
-├── registry.go       # Registry struct, Default, New, NewFrom
-├── register.go       # Set, Register, RegisterFunc, RegisterScoped
-├── resolve.go        # Resolve, Get
-├── scope.go          # BeginScope, cleanupScope
-├── introspect.go     # IsRegistered, Clear
+├── registry.go     # Registry struct, Default, New, NewFrom, Hooks/Options
+├── register.go     # Set, Register, RegisterFunc, RegisterScoped
+├── resolve.go      # Resolve, ResolveOK, Get, findEntry
+├── scope.go        # scopeStore, BeginScope, scope plumbing
+├── buildchain.go   # cycle-detection chain carried through ctx
+├── context.go      # WithRegistry, RegistryFromCtx
+├── introspect.go   # IsRegistered, Keys, Clear
 ├── middleware/
-│   └── http.go       # net/http middleware – stdlib, Chi, Echo
-└── registry_test.go
+│   └── http.go     # net/http middleware — stdlib, Chi, Echo
+└── *_test.go
 ```
 
 ---
 
-## Publikus API
+## Public API
 
-### Létrehozás
+### Creation
 
 ```go
-grr.Default               // globális singleton – sugar, belépési pont
-r := grr.New()            // izolált registry, nincs parent
-r := grr.NewFrom(parent)  // parent chain – fallback lookup
+grr.Default               // global singleton — sugar, entry point
+r := grr.New()            // isolated registry, no parent, own scope store
+r := grr.NewFrom(parent)  // parent chain — fallback lookup, shared scope store
+r := grr.New(grr.WithHooks(grr.Hooks{...})) // with observability hooks
 ```
 
-### Regisztráció
+### Registration
 
 ```go
-// Singleton sugar – factory mindig ugyanazt adja vissza
+// Fixed value — the factory always returns the same value (singleton sugar).
 r.Set("key", value)
 
-// Transient vagy singleton – a factory függvény dönti el
-r.Register("key", func(ctx context.Context) any {
-    return newSomething(ctx)
-})
+// Transient or singleton — the factory's own logic decides.
+r.Register("key", func(ctx context.Context) any { return newSomething(ctx) })
 
-// Sugar – ctx nélküli factory
-r.RegisterFunc("key", func() any {
-    return newSomething()
-})
+// Sugar — context-less factory.
+r.RegisterFunc("key", func() any { return newSomething() })
 
-// Scoped – scope ID alapján egy példány per scope
-r.RegisterScoped("key", func(ctx context.Context) any {
-    return newSomething(ctx)
-})
+// Scoped — one instance per scope, keyed by scope ID.
+r.RegisterScoped("key", func(ctx context.Context) any { return newSomething(ctx) })
 ```
 
-> **Nincs return érték** – duplikált regisztráció panic, nem error.
+> **No return value** — a duplicate registration panics, it doesn't return an error.
 
-### Lekérdezés
+### Lookup
 
 ```go
-r.Resolve(ctx, "key")  // univerzális – ctx mindig van
-r.Get("key")           // sugar = Resolve(context.Background(), "key")
+r.Resolve(ctx, "key")        // universal — ctx always present
+r.Get("key")                 // sugar = Resolve(context.Background(), "key")
+r.ResolveOK(ctx, "key")      // (any, bool) — false only if the key isn't registered
 ```
+
+`ResolveOK` softens **only** the "not registered" case. Resolving a scoped
+key with no active scope, a circular dependency, or resolving after the
+scope ended still panic — those are bugs, not conditions to branch on.
 
 ### Scope lifecycle
 
 ```go
 ctx, endScope := r.BeginScope(ctx)
 defer endScope()
-// endScope: sync.Once védett – kétszeri hívás nem panic
-// ctx.Done() esetén goroutine automatikusan cleanup-ol
+// endScope: idempotent (sync.Once) — calling it twice is safe
+// on ctx.Done(): a goroutine cleans up automatically
 ```
 
-### Introspekció
+### Introspection
 
 ```go
-r.IsRegistered("key")  // bool – kondicionális regisztrációhoz
-r.Clear()              // teljes reset – főleg test teardown
+r.IsRegistered("key")  // bool — walks the parent chain
+r.Keys()               // []string — keys in THIS registry only, not parents
+r.Clear()              // full reset — mostly for test teardown
 ```
 
 ### Context helpers
 
 ```go
-grr.WithRegistry(ctx, r)   // registry csatolása ctx-re
-grr.RegistryFromCtx(ctx)   // registry kiolvasása ctx-ből, fallback: grr.Default
+grr.WithRegistry(ctx, r)   // attach registry to ctx
+grr.RegistryFromCtx(ctx)   // read registry from ctx, fallback: grr.Default
 ```
 
+### Observability hooks
+
+```go
+r := grr.New(grr.WithHooks(grr.Hooks{
+    OnResolve:    func(key string, dur time.Duration) { ... },
+    OnScopeBegin: func() { ... },
+    OnScopeEnd:   func() { ... },
+}))
+```
+
+A nil hook is never called — the no-hook path costs one nil check. Hooks
+belong to the registry they're set on, regardless of which registry in a
+chain owns the resolved entry.
+
 ---
 
-## Lifetime szemantika
+## Lifetime semantics
 
-| Regisztráció | Lifetime | Ki dönti el |
+| Registration | Lifetime | Decided by |
 |---|---|---|
-| `Set` | singleton | sugar – factory mindig ugyanazt adja |
-| `Register` | transient vagy singleton | a factory függvény logikája |
-| `RegisterFunc` | transient vagy singleton | a factory függvény logikája |
-| `RegisterScoped` | scoped | registry – scope ID alapján |
+| `Set` | singleton | sugar — the factory always returns the same value |
+| `Register` | transient or singleton | the factory's logic |
+| `RegisterFunc` | transient or singleton | the factory's logic |
+| `RegisterScoped` | scoped | the registry — keyed by scope ID |
 
-**Context nélküli scoped = transient** – nincs scope azonosítás, ezért minden resolve új példányt ad.
+**Scoped without a scope = panic.** There is no scope ID to key on, so this
+is treated as a programmer error (see the behavioral guarantees below).
 
 ---
 
-## Belső struktúra
+## Internal structure
 
 ```go
 type entry struct {
@@ -131,67 +156,122 @@ type Registry struct {
     entries map[string]*entry
     parent  *Registry
 
-    scopeMu sync.RWMutex
-    scopes  map[uint64]map[string]any  // scopeID → key → instance
+    scopes *scopeStore // per-chain scope cache (see below)
+    hooks  Hooks
 }
+
+// One per registry chain. New() allocates a fresh one; NewFrom shares the
+// parent's. Holds the live scopes and the mutex guarding them.
+type scopeStore struct {
+    mu     sync.RWMutex
+    scopes map[uint64]*scopeData
+}
+
+// Process-global, monotonic, lock-free — see "Scope storage" below for why
+// the IDs are global even though the maps aren't.
+var scopeCounter uint64
 ```
 
-**RWMutex stratégia:**
-- `Resolve` / `Get` → `RLock` – párhuzamos olvasók nem blokkolják egymást
-- `Register` / `Set` / `Clear` → `Lock` – kizárólagos írás
-- `scopes` map külön `scopeMu`-val védett
+**RWMutex strategy:**
+- `Resolve` / `Get` / `findEntry` → `RLock` on `r.mu` — concurrent readers don't block each other.
+- `Register` / `Set` / `Clear` → `Lock` on `r.mu` — exclusive writes.
+- The scope cache is guarded by `scopeStore.mu`, separate from `r.mu`.
 
 ---
 
-## Viselkedési garanciák
+## Scope storage
 
-| Eset | Viselkedés |
+Scope state lives in a `scopeStore` owned by the registry, **not** in package
+globals. The store is shared across a parent/child chain (`NewFrom` copies
+the parent's pointer) but a standalone `New()` gets its own. Consequences:
+
+- `New()` registries are genuinely isolated, scope state included.
+- The cache mutex is per-chain, so independent registries don't serialize
+  on one process-wide lock.
+
+The **scope ID counter, however, is a single process-global atomic**
+(`scopeCounter`). That's deliberate: a global monotonic counter is a
+lock-free atomic add with negligible contention, and keeping IDs unique
+across *all* stores means a context carrying a scope ID from one chain,
+used against an unrelated chain, correctly misses (and panics) instead of
+silently colliding with that chain's same-numbered scope. Splitting the
+counter per-store reintroduced exactly that collision — caught by
+`TestIsolatedRegistriesHaveSeparateScopeState` (see the decisions log).
+
+---
+
+## Behavioral guarantees
+
+| Case | Behavior |
 |---|---|
-| Duplikált regisztráció ugyanabban a registry-ben | **panic** |
-| Scoped resolve scope ID nélkül | **panic** |
-| `Get` scoped entry-re | **panic** |
-| Key nem található, nincs parent | **panic** |
-| Key nem található, van parent | parent chain lookup |
-| Párhuzamos resolve | RWMutex – biztonságos |
-| `endScope` kétszer hívva | sync.Once – nem panic |
-| `ctx.Done()` endScope előtt | goroutine cleanup – nem leak |
+| Duplicate registration in the same registry | **panic** |
+| Scoped resolve without a scope ID | **panic** |
+| `Get` on a scoped entry | **panic** |
+| Key not found, no parent | **panic** |
+| Key not found via `ResolveOK` | `(nil, false)` — no panic |
+| Key not found, has parent | parent chain lookup |
+| Concurrent resolve | RWMutex — safe |
+| `endScope` called twice | sync.Once — no panic |
+| `ctx.Done()` before `endScope` | goroutine cleanup — no leak |
+| Circular dependency | **panic** with the full chain (`a -> b -> a`) |
 
 ---
 
-## Scope belső működése
+## Scope internals
 
 ```go
 func (r *Registry) BeginScope(parent context.Context) (context.Context, func()) {
-    scopeID := atomic.AddUint64(&scopeCounter, 1)
+    store := r.scopes
+    scopeID := store.begin() // global atomic ID + insert into this store
     ctx := context.WithValue(parent, scopeKey{}, scopeID)
 
-    stop := make(chan struct{})
+    if r.hooks.OnScopeBegin != nil {
+        r.hooks.OnScopeBegin()
+    }
 
+    // Teardown runs exactly once, whichever path reaches it first.
+    var releaseOnce sync.Once
+    release := func() {
+        releaseOnce.Do(func() {
+            store.cleanup(scopeID)
+            if r.hooks.OnScopeEnd != nil {
+                r.hooks.OnScopeEnd()
+            }
+        })
+    }
+
+    stop := make(chan struct{})
     go func() {
         select {
         case <-ctx.Done():
+            release()
         case <-stop:
         }
-        r.cleanupScope(scopeID)
     }()
 
-    var once sync.Once
+    var endOnce sync.Once
     endScope := func() {
-        once.Do(func() { close(stop) })
+        endOnce.Do(func() {
+            release()   // synchronous — callers expect teardown done on return
+            close(stop) // let the watcher goroutine exit
+        })
     }
-
     return ctx, endScope
 }
 ```
 
+`release` (cleanup + `OnScopeEnd`) is guarded by its own `sync.Once` shared
+between the explicit `endScope` and the ctx-cancellation path, so the scope
+is torn down — and `OnScopeEnd` fired — exactly once no matter which fires
+first.
+
 ---
 
-## HTTP Middleware
+## HTTP middleware
 
-### net/http (stdlib, Chi, Echo) – core részben
+### net/http (stdlib, Chi, Echo) — in core
 
 ```go
-// grr/middleware/http.go
 func Middleware(r *Registry) func(http.Handler) http.Handler {
     return func(next http.Handler) http.Handler {
         return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -204,81 +284,117 @@ func Middleware(r *Registry) func(http.Handler) http.Handler {
 }
 ```
 
-### Gin – külön repo (`github.com/arpaad/grr-gin`)
+### Gin — separate repo (`github.com/arpaad/grr-gin`)
 
-```go
-func Middleware(r *grr.Registry) gin.HandlerFunc {
-    return func(c *gin.Context) {
-        ctx := grr.WithRegistry(c.Request.Context(), r)
-        ctx, endScope := r.BeginScope(ctx)
-        defer endScope()
-        c.Request = c.Request.WithContext(ctx)
-        c.Next()
-    }
-}
-```
+Kept out of core so `grr` never needs a Gin dependency. Same pattern:
+attach the registry, begin a scope, defer `endScope`, call the next handler.
 
 ---
 
-## Parent chain – fallback lookup
+## Parent chain — fallback lookup
 
 ```
-grr.Default          ← gyökér, mindig jelen van
+grr.Default          ← root, always present
     └── appRegistry  ← NewFrom(Default), production override
             └── r    ← NewFrom(appRegistry), test override
 ```
 
+A child shares its parent's scope store, so a scoped entry registered on a
+parent resolves correctly through a scope begun on a child.
+
 ---
 
-## Tesztelési pattern
+## Testing pattern
 
 ```go
-// Csak egy elemet override-olok, a többi fallback a Default-ra
+// Override one key, fall back to Default for the rest.
 func TestSomething(t *testing.T) {
     r := grr.NewFrom(grr.Default)
-    r.Register("db", func(ctx context.Context) any {
-        return &mockDB{}
-    })
-    svc := NewUserService(r)
+    r.Register("db", func(ctx context.Context) any { return &mockDB{} })
 }
 
-// Teljesen izolált – nincs fallback
+// Fully isolated — no fallback.
 func TestIsolated(t *testing.T) {
     r := grr.New()
     r.Set("config", testConfig)
-    r.Register("db", mockDBFactory)
 }
 ```
 
 ---
 
-## Ami nem tartozik a `grr`-be
+## What does NOT belong in `grr`
 
-| Funkció | Hol lesz |
+| Concern | Where it lives |
 |---|---|
-| Típusbiztonság – cast a hívó dolga, `any` alapú | `gold` réteg |
-| Domain fogalom – Logic, port/adapter szeparáció | `gold` |
-| Scoped kikényszerítése compile time-ban | `gold` |
-| Pooled lifetime | később, külön tervezés |
-| Observability hook | később, külön tervezés |
+| Type safety — casting is the caller's job, `any`-based storage | the `gold` layer |
+| Domain concepts — Logic, port/adapter separation | `gold` |
+| Compile-time enforcement of scoped usage | `gold` |
+| Pooled lifetime | dropped — see [plan.md](plan.md) |
 
 ---
 
-## Nyílt kérdések
+## Open questions
 
-- [x] Modul path véglegesítve: `github.com/arpaad/grr`
-- [x] `grr` betűszó véglegesítve: **Go Registry Resolver** – a két alapművelet (Register, Resolve) adja a nevet
-- [ ] Pooled lifetime tervezése (max N példány, release mechanizmus) — **2. fázis**
-- [ ] Observability hook – mikor és hol — **2. fázis**
+- [x] Module path: `github.com/arpaad/grr`
+- [x] The `grr` acronym: **Go Registry Resolver** — the two core operations (Register, Resolve)
+- [x] Scope storage: package globals → per-chain `*scopeStore` with a global ID counter (done in 0.2-dev)
+- [ ] Whether to keep the per-scope cleanup goroutine, or make it opt-in — decide with benchmark data (**Phase 2**, see plan.md)
 
 ---
 
-## Implementáció közben felmerült döntések / talált hibák
+## Decisions and bugs found during implementation
 
-> v0.1 implementáció (2026-06-16) – core + middleware + tesztek megírva, minden zöld.
+> v0.1 (2026-06-16) — core + middleware + tests written, all green.
 
-- **Ellentmondás feloldva:** a "Lifetime szemantika" szekció szerint *"Context nélküli scoped = transient"*, a "Viselkedési garanciák" tábla szerint *"Scoped resolve scope ID nélkül → panic"*. A két állítás ütközött. A `gold` terv hibafilozófiája ("Do – scoped, nincs BeginScope → panic") alapján a **panic** verziót implementáltam – ez a konzisztens viselkedés mindkét repóban. A "Context nélküli scoped = transient" mondat a táblázat fölött **elavult**, érdemes törölni.
-- **Scope-tárolás globális, nem per-Registry:** mivel a scope ID már globálisan egyedi (atomic counter), a scope cache-t nem az adott `Registry` struct-on tartom (`r.scopes`), hanem egy package-szintű táblában. Ok: ha egy scoped entry a **parent** registry-ben van regisztrálva, de a `BeginScope`-ot egy **child** registry-n hívják meg, a cache-nek mindenképp elérhetőnek kell lennie – nem a regisztráló, hanem a scope-ot kezdő oldalon. Per-Registry tárolással ez hibásan panic-olt volna.
-- **Talált és javított deadlock:** az első implementációban a teljes scope cache-t egyetlen mutex védte, amit a `Resolve` a factory hívása *alatt* is fogva tartott. Ha egy scoped factory maga is `Resolve`-olt egy másik scoped kulcsot ugyanabban a scope-ban (gyakori eset: egy repo modell függ egy másik scoped erőforrástól, pl. egy tranzakciótól), **deadlock** lépett fel, mert a mutex nem reentrant. Megoldás: minden (scope, kulcs) párhoz saját `sync.Once`, a factory hívása nem tart zárva semmilyen megosztott lockot. Lefedve teszttel (`TestScopedFactoryCanResolveAnotherScopedKey`, `TestScopedConcurrentResolveBuildsOnce`).
-- **Körkörös függőség – megoldva, panic:** a `Resolve` minden hívási láncban végigviszi a `ctx`-en, mely kulcsok építése van éppen folyamatban (`buildchain.go`). Ha egy factory (scoped vagy nem-scoped) közvetlenül vagy közvetve önmagát próbálja resolve-olni, ez **panic**-ot dob a teljes lánccal (`grr: circular dependency: a -> b -> a`), *mielőtt* a korábbi implementáció deadlockolt volna (scoped esetben a nem-reentrant `sync.Once.Do` miatt) vagy stack overflow-zott volna (nem-scoped, transient esetben). A legitim, nem köríves nested resolve (egy modell egy másik scoped erőforrástól függ) továbbra is hibátlanul működik – ezt külön lánc-bejegyzés különbözteti meg a körtől. Lásd `TestCircularScopedDependencyPanics`, `TestCircularDependencyThreeKeysPanics`, `TestCircularNonScopedDependencyPanics`.
-- **`endScope` szinkron takarítás:** a tervben vázolt `close(stop)` mintát kiegészítettem azzal, hogy `endScope` *azonnal*, szinkron módon töröl a scope cache-ből (nem csak a háttér-goroutine-on keresztül, aszinkron). Indok: a hívó `defer endScope()` után determinisztikusan elvárja, hogy a scope véget érjen – aszinkron takarítással ez race lett volna (a teszt is elkapta).
+- **Contradiction resolved:** the original "lifetime semantics" section said
+  *"scoped without a context = transient"*, while the guarantees table said
+  *"scoped resolve without a scope ID → panic"*. The two conflicted. Per the
+  `gold` error philosophy ("Do — scoped, no BeginScope → panic"), the
+  **panic** version was implemented — consistent across both repos.
+- **Deadlock found and fixed:** the first implementation guarded the whole
+  scope cache with one mutex held *during* the factory call. If a scoped
+  factory itself resolved another scoped key in the same scope (a repo model
+  depending on a scoped transaction, say), it **deadlocked** — the mutex
+  isn't reentrant. Fix: a per-(scope, key) `sync.Once`, so calling a factory
+  holds no shared lock. Covered by `TestScopedFactoryCanResolveAnotherScopedKey`
+  and `TestScopedConcurrentResolveBuildsOnce`.
+- **Circular dependency — resolved, panics:** `Resolve` threads the chain of
+  keys currently being built through `ctx` ([buildchain.go](buildchain.go)).
+  A factory that directly or transitively resolves itself **panics** with the
+  full chain (`grr: circular dependency: a -> b -> a`) *before* it can
+  deadlock (scoped, via the non-reentrant `sync.Once`) or stack-overflow
+  (non-scoped). Legitimate nested resolves still work — a separate chain
+  entry distinguishes them from a cycle. See `TestCircularScopedDependencyPanics`,
+  `TestCircularDependencyThreeKeysPanics`, `TestCircularNonScopedDependencyPanics`.
+- **`endScope` cleans up synchronously:** the planned `close(stop)` pattern
+  was extended so `endScope` deletes from the scope cache *immediately and
+  synchronously*, not only via the background goroutine. Callers `defer
+  endScope()` and deterministically expect the scope to be over on return;
+  async-only cleanup was a race (a test caught it).
+
+> v0.2-dev (2026-06-17) — scope storage refactor, hooks, Keys/ResolveOK.
+
+- **Scope storage: package globals → per-chain `*scopeStore`.** The global
+  `scopes` map + mutex meant `New()` registries weren't truly isolated and
+  every `BeginScope`/cleanup contended on one process-wide lock. Moved the
+  map+mutex onto a `scopeStore` value owned by the registry; `NewFrom` shares
+  the parent's pointer (preserving cross-chain resolution), `New()` gets a
+  fresh one.
+- **The ID counter stayed global — found by a failing test.** The first cut
+  of the refactor also moved the scope ID counter onto the store. That made
+  IDs collide across stores (each starts at 1), so a context from registry A
+  used against registry B silently hit B's scope #1 instead of panicking.
+  `TestIsolatedRegistriesHaveSeparateScopeState` failed and exposed it. Fix:
+  keep a single process-global atomic counter for IDs (lock-free, negligible
+  contention) while the maps stay per-store — uniqueness across stores
+  restores the correct "foreign context misses and panics" behavior.
+- **`OnScopeEnd` fires exactly once across both teardown paths.** Sharing one
+  `releaseOnce` between `endScope` and the ctx-cancellation goroutine
+  guarantees the hook (and the cache cleanup) run once, never twice on a
+  cancel-then-endScope sequence. Covered by `TestScopeHooksFireOnEndScope`
+  and `TestScopeEndHookFiresOnCtxCancel`.
+- **`ResolveOK`/`Keys` are deliberately narrow.** `ResolveOK` only converts
+  the "not registered" panic into `(nil, false)`; misuse panics stay panics.
+  `Keys` lists the registry's own entries, not the parent chain, so callers
+  can reason about what a single registry declares (this is what `gold.Validate`
+  builds on).
